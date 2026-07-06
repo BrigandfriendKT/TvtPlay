@@ -111,11 +111,13 @@ void CTsTimestampShifter::Transform_(BYTE *pPacket)
         // ここに来る頻度はそれほど高くないので最適化していない
         // 全てのPMTリストにあるPES監視
         for (size_t i = 0; i < m_pat.pmt.size(); ++i) {
-            const PMT *pPmt = &m_pat.pmt[i];
+            const PMT* pPmt = &m_pat.pmt[i];
             for (int j = 0; j < pPmt->pid_count; ++j) {
                 if (header.pid == pPmt->pid[j]) {
                     PES_HEADER pesHeader;
-                    extract_pes_header(&pesHeader, pPayload, payloadSize/*, pPmt->stream_type[j]*/);
+                    extract_pes_header(&pesHeader, pPayload, payloadSize);
+
+                    // AAC LC LATM 対応 (簡略版)
                     if (pesHeader.packet_start_code_prefix &&
                         pesHeader.pts_dts_flags >= 2)
                     {
@@ -133,64 +135,65 @@ void CTsTimestampShifter::Transform_(BYTE *pPacket)
     }
 }
 
-
 CTsSender::CTsSender()
-    : m_curr(nullptr)
-    , m_head(nullptr)
-    , m_tail(nullptr)
-    , m_unitSize(0)
-    , m_fTrimPacket(false)
-    , m_fUnderrunCtrl(false)
-    , m_pcrDisconThreshold(0xffffffff)
-    , m_sock(INVALID_SOCKET)
-    , m_udpPort(0)
-    , m_hPipe(INVALID_HANDLE_VALUE)
-    , m_hCtrlPipe(INVALID_HANDLE_VALUE)
-    , m_pipeNumber(-1)
-    , m_baseTick(0)
-    , m_renewSizeTick(0)
-    , m_renewDurTick(0)
-    , m_renewFsrTick(0)
-    , m_pcr(0)
-    , m_basePcr(0)
-    , m_initPcr(0)
-    , m_prevPcr(0)
-    , m_lastSentPcr(0)
-    , m_rateCtrlMsec(0)
-    , m_fileState(FILE_ST_FIXED)
-    , m_fEnPcr(false)
-    , m_fPause(false)
-    , m_fPurged(false)
-    , m_fForceSyncRead(false)
-    , m_pcrPid(-1)
-    , m_pcrPidsLen(0)
-    , m_fileSize(0)
-    , m_duration(0)
-    , m_totBaseUnixTime(0)
-    , m_totBasePcr(0)
-    , m_hash(-1)
-    , m_oldHash(-1)
-    , m_speedNum(100)
-    , m_speedDen(100)
-    , m_initStore(INITIAL_STORE_MSEC)
-    , m_specialExtendInitRate(0)
-    , m_adjBaseTick(0)
-    , m_adjFreq(0)
-    , m_adjBase(0)
-{
-}
+        : m_curr(nullptr)
+        , m_head(nullptr)
+        , m_tail(nullptr)
+        , m_unitSize(0)
+        , m_fTrimPacket(false)
+        , m_fUnderrunCtrl(false)
+        , m_pcrDisconThreshold(0xffffffff)
+        , m_sock(INVALID_SOCKET)
+        , m_udpPort(0)
+        , m_hPipe(INVALID_HANDLE_VALUE)
+        , m_hCtrlPipe(INVALID_HANDLE_VALUE)
+        , m_pipeNumber(-1)
+        , m_baseTick(0)
+        , m_renewSizeTick(0)
+        , m_renewDurTick(0)
+        , m_renewFsrTick(0)
+        , m_pcr(0)
+        , m_basePcr(0)
+        , m_initPcr(0)
+        , m_prevPcr(0)
+        , m_lastSentPcr(0)
+        , m_rateCtrlMsec(0)
+        , m_fileState(FILE_ST_FIXED)
+        , m_fEnPcr(false)
+        , m_fPause(false)
+        , m_fPurged(false)
+        , m_fForceSyncRead(false)
+        , m_pcrPid(-1)
+        , m_pcrPidsLen(0)
+        , m_fileSize(0)
+        , m_duration(0)
+        , m_totBaseUnixTime(0)
+        , m_totBasePcr(0)
+        , m_hash(-1)
+        , m_oldHash(-1)
+        , m_speedNum(100)
+        , m_speedDen(100)
+        , m_initStore(INITIAL_STORE_MSEC)
+        , m_specialExtendInitRate(0)
+        , m_adjBaseTick(0)
+        , m_adjFreq(0)
+        , m_adjBase(0)
+        , m_fHasAacLatmAudio(false)
+    {
+    }
+
+    // デストラクタ
+    CTsSender::~CTsSender()
+    {
+        Close();
+    }
 
 
-CTsSender::~CTsSender()
-{
-    Close();
-}
-
-
-bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, bool fUnderrunCtrl, bool fUseQpc,
-                     int pcrDisconThresholdMsec, const char *&errorMessage)
-{
-    Close();
+    // Open 関数
+    bool CTsSender::Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, bool fUnderrunCtrl, bool fUseQpc,
+        int pcrDisconThresholdMsec, const char*& errorMessage)
+    {
+        Close();
 
     bool fMpeg4 = !_tcsicmp(::PathFindExtension(path), TEXT(".mp4"));
     if (fMpeg4) {
@@ -440,6 +443,14 @@ void CTsSender::Close()
     m_udpPort = 0;
     m_pipeNumber = -1;
     m_tsShifter.Reset();
+
+    PAT zeroPat = {};
+    m_convPat = zeroPat;
+    m_audioLatmStates.clear();
+    m_audioConvBuf.clear();
+    m_newPesBuf.clear();
+    m_adtsPayloadBuf.clear();
+    m_fHasAacLatmAudio = false;
 }
 
 
@@ -1118,6 +1129,8 @@ void CTsSender::CloseCtrlPipe()
 
 void CTsSender::SendData(BYTE *pData, int dataSize)
 {
+    ConvertAudioLatmToAdts(pData, dataSize);
+
     if (m_udpPort != 0) {
         if (m_sock == INVALID_SOCKET) OpenSocket();
         if (m_sock != INVALID_SOCKET) {
@@ -1149,6 +1162,277 @@ void CTsSender::SendData(BYTE *pData, int dataSize)
             }
         }
     }
+}
+
+// PMTセクション内で、対象の音声PID(m_audioLatmStatesに登録済みのPID)のstream_typeが
+// AAC LATM(0x11)ならADTS(0x0F)に書き換え、CRC32を再計算する。
+// 戻り値: 書き換えを行ったらtrue(pkt内のバイト列が変更されている)
+bool CTsSender::PatchPmtAudioStreamType(BYTE *pkt)
+{
+    TS_HEADER header;
+    extract_ts_header(&header, pkt);
+    if (!header.payload_unit_start_indicator ||
+        header.transport_scrambling_control || header.transport_error_indicator) return false;
+
+    BYTE *payload = pkt + 4;
+    int payloadSize = 184;
+    if (header.adaptation_field_control == 3) {
+        int adaptLen = pkt[4];
+        if (adaptLen < 0 || adaptLen > 183) return false;
+        payload = pkt + 5 + adaptLen;
+        payloadSize = 184 - (adaptLen + 1);
+    }
+    else if (header.adaptation_field_control != 1) {
+        return false;
+    }
+
+    if (payloadSize < 4) return false;
+    int pointerField = payload[0];
+    BYTE *table = payload + 1 + pointerField;
+    int tableSize = payloadSize - 1 - pointerField;
+    if (tableSize < 12 || table[0] != 0x02 /*table_id: PMT*/) return false;
+
+    int sectionLength = ((table[1] & 0x0f) << 8) | table[2];
+    int totalSecLen = 3 + sectionLength;
+    if (sectionLength < 9 || totalSecLen > tableSize) return false; // 複数パケットに跨るPMTは非対応
+
+    int programInfoLength = ((table[10] & 0x03) << 8) | table[11];
+    int pos = 12 + programInfoLength;
+    bool fPatched = false;
+    while (pos + 4 < totalSecLen - 4) {
+        int streamType = table[pos];
+        int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
+        int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
+        if (streamType == STREAM_TYPE_AAC_LATM) {
+            for (size_t j = 0; j < m_audioLatmStates.size(); ++j) {
+                if (m_audioLatmStates[j].pid == esPid) {
+                    table[pos] = ADTS_TRANSPORT; // 0x0F
+                    fPatched = true;
+                    break;
+                }
+            }
+        }
+        pos += 5 + esInfoLength;
+    }
+
+    if (fPatched) {
+        DWORD crc = CalcCrc32(table, totalSecLen - 4);
+        table[totalSecLen - 4] = (BYTE)(crc >> 24);
+        table[totalSecLen - 3] = (BYTE)(crc >> 16);
+        table[totalSecLen - 2] = (BYTE)(crc >> 8);
+        table[totalSecLen - 1] = (BYTE)(crc);
+    }
+    return fPatched;
+}
+
+// 新しいPESパケット列(pes)を188byte単位のTSパケットへ分割してoutへ追加する
+void CTsSender::RepacketizePes(const std::vector<BYTE> &pes, int pid, BYTE &continuityCounter,
+                                std::vector<BYTE> &out)
+{
+    size_t offset = 0;
+    bool fFirst = true;
+    while (offset < pes.size()) {
+        BYTE pkt[188];
+        pkt[0] = 0x47;
+        pkt[1] = (BYTE)((fFirst ? 0x40 : 0x00) | ((pid >> 8) & 0x1f));
+        pkt[2] = (BYTE)(pid & 0xff);
+
+        size_t remain = pes.size() - offset;
+        if (remain >= 184) {
+            pkt[3] = (BYTE)(0x10 | (continuityCounter & 0x0f));
+            memcpy(pkt + 4, &pes[offset], 184);
+            offset += 184;
+        }
+        else {
+            int adaptLen = 183 - (int)remain;
+            pkt[3] = (BYTE)(0x30 | (continuityCounter & 0x0f));
+            pkt[4] = (BYTE)adaptLen;
+            if (adaptLen > 0) {
+                pkt[5] = 0x00; // フラグは全て0
+                if (adaptLen > 1) memset(pkt + 6, 0xff, adaptLen - 1);
+            }
+            if (remain > 0) memcpy(pkt + 5 + adaptLen, &pes[offset], remain);
+            offset += remain;
+        }
+        out.insert(out.end(), pkt, pkt + 188);
+        continuityCounter = (continuityCounter + 1) & 0x0f;
+        fFirst = false;
+    }
+}
+
+// 音声PID(AAC LATM)のTSパケットを1つ処理する。
+// PESが1つ完成したらLATM→ADTS変換のうえTSパケット列を再構成し、outに追加する。
+// (完成していない間はoutに何も追加しない = 送出を1PES分遅延させる)
+void CTsSender::ProcessAudioLatmPacket(AudioLatmState &state, const BYTE *pkt, const TS_HEADER &header,
+                                        std::vector<BYTE> &out)
+{
+    if (header.transport_scrambling_control || header.transport_error_indicator) return;
+
+    const BYTE *payload = pkt + 4;
+    int payloadSize = 184;
+    if (header.adaptation_field_control == 3) {
+        int adaptLen = pkt[4];
+        if (adaptLen < 0 || adaptLen > 183) { state.pesBuffer.clear(); return; }
+        payload = pkt + 5 + adaptLen;
+        payloadSize = 184 - (adaptLen + 1);
+    }
+    else if (header.adaptation_field_control != 1) {
+        return; // ペイロード無し
+    }
+    if (payloadSize <= 0) return;
+
+    if (header.payload_unit_start_indicator) {
+        state.pesBuffer.assign(payload, payload + payloadSize);
+    }
+    else {
+        if (state.pesBuffer.empty()) return; // 先頭を取り損ねているので破棄
+        state.pesBuffer.insert(state.pesBuffer.end(), payload, payload + payloadSize);
+    }
+
+    if (state.pesBuffer.size() < 6) return;
+    if (state.pesBuffer[0] != 0 || state.pesBuffer[1] != 0 || state.pesBuffer[2] != 1) {
+        state.pesBuffer.clear();
+        return;
+    }
+    int pesPacketLength = (state.pesBuffer[4] << 8) | state.pesBuffer[5];
+    if (pesPacketLength == 0) {
+        // 長さ不定のPESは想定していない(音声では通常来ない)
+        state.pesBuffer.clear();
+        return;
+    }
+    size_t totalPesSize = 6 + (size_t)pesPacketLength;
+    if (state.pesBuffer.size() < totalPesSize) return; // まだ集まっていない
+
+    int headerDataLength = state.pesBuffer[8];
+    size_t esOffset = 9 + headerDataLength;
+    if (esOffset > totalPesSize) {
+        state.pesBuffer.clear();
+        return;
+    }
+
+    std::vector<BYTE> &newPes = m_newPesBuf;
+    std::vector<BYTE> &adtsPayload = m_adtsPayloadBuf;
+    newPes.clear();
+    adtsPayload.clear();
+    bool fOk = ConvertLatmToAdts(&state.pesBuffer[esOffset], (int)(totalPesSize - esOffset),
+                                  state.latmConfig, adtsPayload);
+    if (fOk) {
+        int newPesPacketLength = (int)(esOffset - 6) + (int)adtsPayload.size();
+        newPes.assign(state.pesBuffer.begin(), state.pesBuffer.begin() + esOffset);
+        newPes[4] = (BYTE)(newPesPacketLength >> 8);
+        newPes[5] = (BYTE)(newPesPacketLength & 0xff);
+        newPes.insert(newPes.end(), adtsPayload.begin(), adtsPayload.end());
+    }
+    else {
+        // 変換できなければ元のPESをそのまま使う(無音は改善しないがストリームは壊さない)
+        newPes.assign(state.pesBuffer.begin(), state.pesBuffer.begin() + totalPesSize);
+    }
+
+    RepacketizePes(newPes, header.pid, state.continuityCounter, out);
+
+    state.pesBuffer.clear();
+}
+
+// SendDataで送出する直前のTSパケット列を走査し、AAC LATM音声をADTSへ変換する。
+// 対象の音声が無い場合(通常のケース)は何もせず、pData/dataSizeを変更しない。
+void CTsSender::ConvertAudioLatmToAdts(BYTE *&pData, int &dataSize)
+{
+    if (m_unitSize != 188) return; // 188byte単位以外は非対応(そのまま送出)
+
+    // 高速パス: 対象の音声を検出するまではPAT/PMTの監視だけ行う
+    bool fScanOnly = !m_fHasAacLatmAudio;
+
+    m_audioConvBuf.clear();
+    m_audioConvBuf.reserve(dataSize);
+
+    for (BYTE *p = pData; p + 188 <= pData + dataSize; p += 188) {
+        TS_HEADER header;
+        extract_ts_header(&header, p);
+
+        if (header.pid == 0 && header.payload_unit_start_indicator &&
+            !header.transport_scrambling_control && !header.transport_error_indicator)
+        {
+            BYTE *payload = p + 4;
+            int payloadSize = 184;
+            if (header.adaptation_field_control == 3) {
+                int adaptLen = p[4];
+                if (adaptLen >= 0 && adaptLen <= 183) {
+                    payload = p + 5 + adaptLen;
+                    payloadSize = 184 - (adaptLen + 1);
+                }
+            }
+            if (header.adaptation_field_control & 1) {
+                extract_pat(&m_convPat, payload, payloadSize,
+                            header.payload_unit_start_indicator, header.continuity_counter);
+            }
+            m_audioConvBuf.insert(m_audioConvBuf.end(), p, p + 188);
+            continue;
+        }
+
+        bool fPmtPacket = false;
+        for (size_t i = 0; i < m_convPat.pmt.size(); ++i) {
+            if (header.pid == m_convPat.pmt[i].pmt_pid) {
+                if (!header.transport_scrambling_control && !header.transport_error_indicator &&
+                    (header.adaptation_field_control & 1))
+                {
+                    BYTE *payload = p + 4;
+                    int payloadSize = 184;
+                    if (header.adaptation_field_control == 3) {
+                        int adaptLen = p[4];
+                        if (adaptLen >= 0 && adaptLen <= 183) {
+                            payload = p + 5 + adaptLen;
+                            payloadSize = 184 - (adaptLen + 1);
+                        }
+                    }
+                    extract_pmt(&m_convPat.pmt[i], payload, payloadSize,
+                                header.payload_unit_start_indicator, header.continuity_counter);
+
+                    // 新たに検出されたAAC LATM音声を登録する
+                    for (int j = 0; j < m_convPat.pmt[i].pid_count; ++j) {
+                        if (m_convPat.pmt[i].stream_type[j] == STREAM_TYPE_AAC_LATM) {
+                            bool fExists = false;
+                            for (size_t k = 0; k < m_audioLatmStates.size(); ++k) {
+                                if (m_audioLatmStates[k].pid == m_convPat.pmt[i].pid[j]) { fExists = true; break; }
+                            }
+                            if (!fExists) {
+                                AudioLatmState st = {};
+                                st.pid = m_convPat.pmt[i].pid[j];
+                                m_audioLatmStates.push_back(st);
+                                m_fHasAacLatmAudio = true;
+                            }
+                        }
+                    }
+
+                    BYTE patched[188];
+                    memcpy(patched, p, 188);
+                    PatchPmtAudioStreamType(patched);
+                    m_audioConvBuf.insert(m_audioConvBuf.end(), patched, patched + 188);
+                }
+                else {
+                    m_audioConvBuf.insert(m_audioConvBuf.end(), p, p + 188);
+                }
+                fPmtPacket = true;
+                break;
+            }
+        }
+        if (fPmtPacket) continue;
+
+        if (!fScanOnly) {
+            AudioLatmState *pState = nullptr;
+            for (size_t k = 0; k < m_audioLatmStates.size(); ++k) {
+                if (m_audioLatmStates[k].pid == header.pid) { pState = &m_audioLatmStates[k]; break; }
+            }
+            if (pState) {
+                ProcessAudioLatmPacket(*pState, p, header, m_audioConvBuf);
+                continue;
+            }
+        }
+
+        m_audioConvBuf.insert(m_audioConvBuf.end(), p, p + 188);
+    }
+
+    pData = m_audioConvBuf.empty() ? pData : &m_audioConvBuf[0];
+    dataSize = (int)m_audioConvBuf.size();
 }
 
 // 受信側に要求を送る

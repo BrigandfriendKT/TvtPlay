@@ -2,7 +2,11 @@
 #define INCLUDE_TS_SENDER_H
 
 #include "BufferedFileReader.h"
+#include "AacLatm.h"
 #include <memory>
+#include <vector>
+
+#define STREAM_TYPE_AAC_LATM  0x11   // ISO/IEC 14496-3 Audio with LATM/LOAS
 
 #define BON_PIPE_MESSAGE_MAX  128
 
@@ -40,7 +44,7 @@ class CTsSender
     static const int READ_TO_PCR_LIMIT_PACKETS = 120000;
 public:
     CTsSender();
-    ~CTsSender();
+    ~CTsSender();      //
     bool Open(LPCTSTR path, DWORD salt, int bufSize, bool fConvTo188, bool fUnderrunCtrl, bool fUseQpc,
               int pcrDisconThresholdMsec, const char *&errorMessage);
     DWORD GetInitialPcr() { return m_initPcr; }
@@ -86,6 +90,20 @@ private:
     int TransactMessage(LPCTSTR request, LPTSTR reply = nullptr);
     static DWORD DiffPcr(DWORD a, DWORD b) { return ((a-b)&0x80000000) && b-a<PCR_LAP_THRESHOLD ? 0 : a-b; }
 
+    // AAC LATM(8K等)音声をADTSへ変換して送出するための処理
+    struct AudioLatmState {
+        int pid;
+        BYTE continuityCounter;
+        std::vector<BYTE> pesBuffer;
+        LatmAudioConfig latmConfig;
+    };
+    void ConvertAudioLatmToAdts(BYTE *&pData, int &dataSize);
+    bool PatchPmtAudioStreamType(BYTE *pkt);
+    void ProcessAudioLatmPacket(AudioLatmState &state, const BYTE *pkt, const TS_HEADER &header,
+                                 std::vector<BYTE> &out);
+    static void RepacketizePes(const std::vector<BYTE> &pes, int pid, BYTE &continuityCounter,
+                                std::vector<BYTE> &out);
+
     std::unique_ptr<IReadOnlyFile> m_file;
     CBufferedFileReader m_reader;
     BYTE *m_curr, *m_head, *m_tail;
@@ -121,6 +139,14 @@ private:
 
     DWORD m_adjBaseTick;
     __int64 m_adjFreq, m_adjBase;
+
+    // AAC LATM(8K等)音声をADTSへ変換して送出するための状態
+    PAT m_convPat;                              // ConvertAudioLatmToAdts専用のPAT/PMT監視状態
+    std::vector<AudioLatmState> m_audioLatmStates;
+    std::vector<BYTE> m_audioConvBuf;
+    std::vector<BYTE> m_newPesBuf;      // ProcessAudioLatmPacket内で使い回す作業バッファ(毎フレーム確保しないため)
+    std::vector<BYTE> m_adtsPayloadBuf; // 同上
+    bool m_fHasAacLatmAudio;
 };
 
 #endif // INCLUDE_TS_SENDER_H

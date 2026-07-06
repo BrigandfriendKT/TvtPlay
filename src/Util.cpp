@@ -343,6 +343,19 @@ static void extract_psi(PSI *psi, const unsigned char *payload, int payload_size
 }
 
 
+// PSIセクション標準のCRC32(CRC-32/MPEG-2: poly=0x04C11DB7, init=0xFFFFFFFF, 反転無し)
+DWORD CalcCrc32(const unsigned char *data, int len)
+{
+    DWORD crc = 0xFFFFFFFF;
+    for (int i = 0; i < len; ++i) {
+        crc ^= (DWORD)data[i] << 24;
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc & 0x80000000) ? (crc << 1) ^ 0x04C11DB7 : (crc << 1);
+        }
+    }
+    return crc;
+}
+
 // 参考: ITU-T H.222.0 Sec.2.4.4.3 および ARIB TR-B14 第一分冊第二編8.2
 void extract_pat(PAT *pat, const unsigned char *payload, int payload_size, int unit_start, int counter)
 {
@@ -428,10 +441,13 @@ void extract_pmt(PMT *pmt, const unsigned char *payload, int payload_size, int u
                 stream_type == AVC_VIDEO ||
                 stream_type == H_265_VIDEO ||
                 stream_type == MPEG2_AUDIO ||
-                stream_type == PS_BD_AC3_AUDIO)
+                stream_type == PS_BD_AC3_AUDIO ||
+                stream_type == AAC_LATM)
             {
-                //pmt->stream_type[pmt->pid_count] = stream_type;
-                pmt->pid[pmt->pid_count++] = (table[pos+1]&0x1f)<<8 | table[pos+2];
+                if (pmt->pid_count < 256) {
+                    pmt->stream_type[pmt->pid_count] = static_cast<unsigned char>(stream_type);
+                    pmt->pid[pmt->pid_count++] = (table[pos+1]&0x1f)<<8 | table[pos+2];
+                }
             }
             es_info_length = (table[pos+3]&0x03)<<8 | table[pos+4];
             pos += 5 + es_info_length;

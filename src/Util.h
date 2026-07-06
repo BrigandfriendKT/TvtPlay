@@ -47,6 +47,8 @@ inline int CounterDiff(DWORD a, DWORD b)
 #define MPEG2_AUDIO         0x04
 // for Blu-ray
 #define PS_BD_AC3_AUDIO     0x81
+// for 8K(ISO/IEC 14496-3 Audio with LATM/LOAS)
+#define AAC_LATM            0x11
 
 typedef struct {
 	int           sync;
@@ -89,7 +91,7 @@ typedef struct {
     int             version_number;
     int             pcr_pid;
     int             pid_count;
-    //unsigned char   stream_type[256];
+    unsigned char   stream_type[256];
     unsigned short  pid[256]; // PESの一部に限定
     PSI             psi;
 } PMT;
@@ -113,6 +115,7 @@ typedef struct {
 void extract_pat(PAT *pat, const unsigned char *payload, int payload_size, int unit_start, int counter);
 void extract_pmt(PMT *pmt, const unsigned char *payload, int payload_size, int unit_start, int counter);
 void extract_pes_header(PES_HEADER *dst, const unsigned char *payload, int payload_size/*, int stream_type*/);
+DWORD CalcCrc32(const unsigned char *data, int len);
 
 int select_unit_size(unsigned char *head, unsigned char *tail);
 unsigned char *resync(unsigned char *head, unsigned char *tail, int unit_size);
