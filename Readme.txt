@@ -1,4 +1,10 @@
-﻿TVTestのBonDriver_UDPやBonDriver_Pipeを使ってファイル再生するプラグインです。
+# 変更内容
+既存TvtPlayで４K、８Kを再生するために追加と修正を加えました。
+UIなどに変更はありません。
+
+（注）市販ソフトでカット編集した場合、音声が正常に出ないこともあります。
+＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿＿
+TVTestのBonDriver_UDPやBonDriver_Pipeを使ってファイル再生するプラグインです。
 使い方などはTvtPlay_Readme.txtを参照してください。
 バイナリはReleases欄。
 
